@@ -1,0 +1,599 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <EEPROM.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Hardware Pin Interconnect Mapping (Adjusted to avoid conflict with GPIO2)
+const int lanPins[8] = {16, 14, 12, -1, 0, 15, -1, -1}; // Pin 4 changed to -1 to free GPIO2
+int pinStates[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+#define DHTPIN 2 // Physical Pin D4 on NodeMCU (GPIO2)
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+const char* ssid = "Yash_Device_";
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+enum ViewMode { VIEW_LAN, VIEW_CLOCK_ZONES, VIEW_STOPWATCH, VIEW_SENSORS, VIEW_SYNC, VIEW_COUNTDOWN };
+ViewMode currentView = VIEW_LAN;
+
+unsigned long lastTick = 0;
+long localEpochSeconds = 43200; 
+int offsetIST = 19800;          
+int offsetEST = -18000;         
+int offsetGMT = 0;              
+
+bool chronoRunning = false;
+unsigned long chronoElapsedBase = 0;
+unsigned long chronoStartMillis = 0;
+
+long countdownTotalSeconds = 0; 
+
+// Advanced Environmental Telemetry Registers
+float currentTemp = 24.0; 
+float currentHumid = 50.0;
+float currentHeatIndex = 24.0;
+float currentDewPoint = 13.0;
+String comfortLevel = "Comfortable";
+String airQualityEst = "Good (Normal)";
+unsigned long lastSensorPoll = 0;
+
+struct BackupConfig {
+  int savedView;
+  unsigned long savedChronoBase;
+  long savedCountdownSeconds;
+} appState;
+
+void syncPinsToMode();
+void refreshOledDisplay();
+void readPins();
+void computeAdvancedMetrics();
+void handleRootRequest();
+void handleStatusPayload();
+void handleActionCommand();
+void handleCaptiveRedirect();
+void saveStateToEeprom();
+void loadStateFromEeprom();
+
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(512);
+  loadStateFromEeprom();
+  
+  Wire.begin(4, 5);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("SSD1306 Allocation Error"));
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 5);
+  display.println(" SYSTEM INITIALIZING");
+  display.println("--------------------");
+  display.println("\nConnect to Wi-Fi AP:");
+  display.print("SSID: "); display.println(ssid);
+  display.println("URL:  192.168.4.1");
+  display.display();
+
+  syncPinsToMode();
+  dht.begin();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid);
+  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
+  server.on("/", handleRootRequest);
+  server.on("/status", handleStatusPayload);
+  server.on("/action", handleActionCommand);
+  server.onNotFound(handleCaptiveRedirect);
+  server.begin();
+
+  delay(2000); 
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+
+  if (millis() - lastTick >= 1000) {
+    lastTick = millis();
+    localEpochSeconds++;
+    if (localEpochSeconds >= 86400) localEpochSeconds = 0;
+
+    if (countdownTotalSeconds > 0) {
+      countdownTotalSeconds--;
+      if (countdownTotalSeconds == 0) {
+        saveStateToEeprom(); 
+      }
+    }
+  }
+
+  // Atmospheric Telemetry Parsing Block
+  if (millis() - lastSensorPoll >= 2500) {
+    lastSensorPoll = millis();
+    float tempReading = dht.readTemperature();
+    float humidReading = dht.readHumidity();
+    
+    if (!isnan(tempReading) && tempReading > 0 && !isnan(humidReading) && humidReading > 0) {
+      currentTemp = tempReading;
+      currentHumid = humidReading;
+      computeAdvancedMetrics();
+    }
+  }
+
+  readPins();
+  
+  if (WiFi.softAPgetStationNum() == 0) {
+    return; 
+  }
+
+  refreshOledDisplay();
+}
+
+void computeAdvancedMetrics() {
+  // 1. Compute Heat Index (Celsius format derived)
+  currentHeatIndex = dht.computeHeatIndex(currentTemp, currentHumid, false);
+
+  // 2. Compute Dew Point (Magnus-Tetens Formula approximation)
+  float a = 17.27;
+  float b = 237.7;
+  float alpha = ((a * currentTemp) / (b + currentTemp)) + log(currentHumid / 100.0);
+  currentDewPoint = (b * alpha) / (a - alpha);
+
+  // 3. Evaluate Comfort Level
+  if (currentHumid < 30) comfortLevel = "Too Dry";
+  else if (currentHumid > 70) comfortLevel = "Sticky/Humid";
+  else if (currentTemp >= 20 && currentTemp <= 26) comfortLevel = "Comfortable";
+  else if (currentTemp < 20) comfortLevel = "Cool Mode";
+  else comfortLevel = "Warm Room";
+
+  // 4. Air Quality Proxy Estimate (Calculated via humidity-density shift approximation)
+  if (currentHumid >= 40 && currentHumid <= 60) airQualityEst = "Optimal Air";
+  else if (currentHumid > 60 && currentHumid <= 80) airQualityEst = "Heavy/Moist";
+  else airQualityEst = "Stale/Dry Air";
+}
+
+void syncPinsToMode() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] != -1) pinMode(lanPins[i], INPUT_PULLUP);
+  }
+}
+
+void readPins() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] == -1) {
+      pinStates[i] = 1; 
+    } else {
+      pinStates[i] = (digitalRead(lanPins[i]) == LOW) ? 1 : 0;
+    }
+  }
+}
+
+void formatTimeOutput(char* buffer, long epoch, int offsetSeconds) {
+  long activeTime = (epoch + offsetSeconds + 86400) % 86400;
+  int h = activeTime / 3600;
+  int m = (activeTime % 3600) / 60;
+  int s = activeTime % 60;
+  sprintf(buffer, "%02d:%02d:%02d", h, m, s);
+}
+
+void saveStateToEeprom() {
+  appState.savedView = (int)currentView;
+  appState.savedChronoBase = chronoElapsedBase;
+  appState.savedCountdownSeconds = countdownTotalSeconds;
+  EEPROM.put(0, appState);
+  EEPROM.commit();
+}
+
+void loadStateFromEeprom() {
+  EEPROM.get(0, appState);
+  if (appState.savedView >= 0 && appState.savedView <= 5) {
+    currentView = (ViewMode)appState.savedView;
+    chronoElapsedBase = appState.savedChronoBase;
+    countdownTotalSeconds = (appState.savedCountdownSeconds < 0) ? 0 : appState.savedCountdownSeconds;
+  } else {
+    currentView = VIEW_LAN;
+    chronoElapsedBase = 0;
+    countdownTotalSeconds = 0;
+  }
+}
+
+void refreshOledDisplay() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  char timeBuffer[16];
+
+  switch(currentView) {
+    case VIEW_LAN:
+      display.setTextSize(2);
+      display.println("   LAN WIRE MATRIX");
+      display.println("--------------------");
+      display.setCursor(5, 20);
+      for (int i = 0; i < 8; i++) {
+        display.print("P"); display.print(i + 1); display.print(":");
+        display.print(pinStates[i] ? "LIVE " : "OPEN ");
+        if (i == 3 || i == 7) display.println("\n");
+      }
+      break;
+
+    case VIEW_CLOCK_ZONES:
+      display.setTextSize(1);
+      display.println("    WORLD CLOCKS");
+      display.println("--------------------");
+      formatTimeOutput(timeBuffer, localEpochSeconds, offsetIST);
+      display.print("IST: "); display.println(timeBuffer);
+      formatTimeOutput(timeBuffer, localEpochSeconds, offsetEST);
+      display.print("EST: "); display.println(timeBuffer);
+      formatTimeOutput(timeBuffer, localEpochSeconds, offsetGMT);
+      display.print("GMT: "); display.println(timeBuffer);
+      break;
+
+    case VIEW_STOPWATCH:
+      display.setTextSize(1);
+      display.println("  PRECISION CHRONO");
+      display.println("--------------------");
+      display.setTextSize(2);
+      display.setCursor(15, 32);
+      {
+        unsigned long totalChrono = chronoElapsedBase;
+        if (chronoRunning) totalChrono += (millis() - chronoStartMillis);
+        unsigned long s = (totalChrono / 1000) % 60;
+        unsigned long m = (totalChrono / 60000) % 60;
+        unsigned long h = (totalChrono / 3600000) % 24;
+        display.printf("%02ld:%02ld:%02ld", h, m, s);
+      }
+      break;
+
+    case VIEW_SENSORS:
+      display.setTextSize(1);
+      display.println("ENVIRONMENT REGISTER");
+      display.println("--------------------");
+      display.printf("Temp: %.1f C \n Heat: %.1f C\n", currentTemp, currentHeatIndex);
+      display.printf("Humudity:  %.1f %% \n Dew_Point: %.1f C\n", currentHumid, currentDewPoint);
+      display.print("Comfort: "); display.println(comfortLevel);
+      display.print("Air Est: "); display.println(airQualityEst);
+      break;
+
+    case VIEW_SYNC:
+      display.setTextSize(1);
+      display.println("   TIME SYNC MODE");
+      display.println("--------------------");
+      display.setTextSize(2);
+      display.setCursor(16, 32);
+      formatTimeOutput(timeBuffer, localEpochSeconds, 0);
+      display.println(timeBuffer);
+      break;
+
+    case VIEW_COUNTDOWN:
+      display.setTextSize(1);
+      display.println("  COUNTDOWN MATRIX");
+      display.println("--------------------");
+      display.setTextSize(2);
+      display.setCursor(5, 32);
+      if (countdownTotalSeconds <= 0) {
+        display.println("  FINISHED  ");
+      } else {
+        long workingSecs = countdownTotalSeconds;
+        long d = workingSecs / 86400; workingSecs %= 86400;
+        long h = workingSecs / 3600;  workingSecs %= 3600;
+        long m = workingSecs / 60;
+        long s = workingSecs % 60;
+        display.printf("%01ldd Days \n %02ld:%02ld:%02ld", d, h, m, s);
+      }
+      break;
+  }
+  display.display();
+}
+
+void handleStatusPayload() {
+  char localTime[16], istTime[16], estTime[16], gmtTime[16];
+  formatTimeOutput(localTime, localEpochSeconds, 0);
+  formatTimeOutput(istTime, localEpochSeconds, offsetIST);
+  formatTimeOutput(estTime, localEpochSeconds, offsetEST);
+  formatTimeOutput(gmtTime, localEpochSeconds, offsetGMT);
+
+  unsigned long totalChrono = chronoElapsedBase;
+  if (chronoRunning) totalChrono += (millis() - chronoStartMillis);
+  unsigned long chronoSecs = (totalChrono / 1000) % 60;
+  unsigned long chronoMins = (totalChrono / 60000) % 60;
+  unsigned long chronoHours = (totalChrono / 3600000) % 24;
+  unsigned long chronoDays = totalChrono / 86400000;
+
+  String json = "{";
+  json += "\"view\":" + String((int)currentView) + ",";
+  json += "\"temp\":" + String(currentTemp, 1) + ",";
+  json += "\"humid\":" + String(currentHumid, 1) + ",";
+  json += "\"heatIndex\":" + String(currentHeatIndex, 1) + ",";
+  json += "\"dewPoint\":" + String(currentDewPoint, 1) + ",";
+  json += "\"comfort\":\"" + comfortLevel + "\",";
+  json += "\"airQual\":\"" + airQualityEst + "\",";
+  json += "\"timeLocal\":\"" + String(localTime) + "\",";
+  json += "\"timeIST\":\"" + String(istTime) + "\",";
+  json += "\"timeEST\":\"" + String(estTime) + "\",";
+  json += "\"timeGMT\":\"" + String(gmtTime) + "\",";
+  json += "\"swDays\":" + String(chronoDays) + ",";
+  json += "\"swHours\":" + String(chronoHours) + ",";
+  json += "\"swMins\":" + String(chronoMins) + ",";
+  json += "\"swSecs\":" + String(chronoSecs) + ",";
+  json += "\"swRunning\":" + String(chronoRunning ? 1 : 0) + ",";
+  json += "\"cdTotal\":" + String(countdownTotalSeconds) + ",";
+  for (int i = 0; i < 8; i++) {
+    json += "\"p" + String(i + 1) + "\":" + String(pinStates[i]) + ",";
+  }
+  json.remove(json.length() - 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleActionCommand() {
+  String act = server.arg("action");
+  if (act == "setView") {
+    currentView = (ViewMode)server.arg("target").toInt();
+    saveStateToEeprom();
+  }
+  else if (act == "syncDeviceTime") {
+    long h = server.arg("h").toInt();
+    long m = server.arg("m").toInt();
+    long s = server.arg("s").toInt();
+    localEpochSeconds = (h * 3600) + (m * 60) + s;
+  }
+  else if (act == "toggleChrono") {
+    if (chronoRunning) {
+      chronoElapsedBase += (millis() - chronoStartMillis);
+      chronoRunning = false;
+    } else {
+      chronoStartMillis = millis();
+      chronoRunning = true;
+    }
+    saveStateToEeprom();
+  }
+  else if (act == "resetChrono") {
+    chronoElapsedBase = 0;
+    chronoRunning = false;
+    saveStateToEeprom();
+  }
+  else if (act == "setCountdown") {
+    long d = server.arg("d").toInt();
+    long h = server.arg("h").toInt();
+    long m = server.arg("m").toInt();
+    long s = server.arg("s").toInt();
+    long requestedTotal = (d * 86400) + (h * 3600) + (m * 60) + s;
+    countdownTotalSeconds = (requestedTotal < 0) ? 0 : requestedTotal;
+    saveStateToEeprom();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleCaptiveRedirect() {
+  server.sendHeader("Location", String("http://192.168.4.1/"), true);
+  server.send(302, "text/plain", "");
+}
+
+void handleRootRequest() {
+  String html = R"=====(
+  <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quantum Diagnostic Console</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; text-align: center; background: #141419; color: #fff; padding: 10px; margin: 0; }
+    .container { max-width: 500px; margin: 15px auto; background: #22222b; padding: 20px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    h2 { margin-bottom: 5px; color: #00adb5; font-size: 22px; }
+    .tab-nav { display: flex; justify-content: space-around; margin-bottom: 20px; background: #2d2d3a; border-radius: 8px; padding: 5px; }
+    .tab-btn { background: none; border: none; color: #aaa; padding: 10px 20px; font-weight: bold; cursor: pointer; border-radius: 6px; width: 50%; transition: 0.2s; font-size: 14px;}
+    .tab-btn.active { background: #00adb5; color: #fff; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .clock-menu { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 20px; }
+    .sub-tab-btn { background: #2d2d3a; border: 1px solid #444; color: #fff; padding: 10px; font-weight: bold; cursor: pointer; border-radius: 8px; transition: 0.2s; font-size: 12px; }
+    .sub-tab-btn.active { background: linear-gradient(90deg, #00f2fe, #4facfe); border-color: transparent; }
+    .pair-container { border: 2px solid #333; padding: 12px; margin-bottom: 15px; border-radius: 10px; background: rgba(0,0,0,0.2); }
+    .pair-title { font-size: 12px; text-transform: uppercase; color: #00adb5; text-align: left; margin-bottom: 8px; font-weight: bold; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pin-card { position: relative; padding: 25px 10px 15px 10px; border-radius: 8px; font-weight: bold; color: white; border: 2px solid #444; background: #2d2d3a; text-align: center; }
+    .wire-stripe { position: absolute; top: 0; left: 0; right: 0; height: 8px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+    .w-orange { background: linear-gradient(90deg, #fff 50%, #ff6b35 50%); background-size: 15px 10px; }
+    .orange { background: #ff6b35; }
+    .w-green { background: linear-gradient(90deg, #fff 50%, #4ecdc4 50%); background-size: 15px 10px; }
+    .green { background: #4ecdc4; }
+    .blue { background: #1a8fe3; }
+    .w-blue { background: linear-gradient(90deg, #fff 50%, #1a8fe3 50%); background-size: 15px 10px; }
+    .w-brown { background: linear-gradient(90deg, #fff 50%, #8b5a2b 50%); background-size: 15px 10px; }
+    .brown { background: #8b5a2b; }
+    .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+    .dot-active { background-color: #39ff14; box-shadow: 0 0 8px #39ff14; }
+    .dot-inactive { background-color: #ff3333; }
+    .master-btn { background: linear-gradient(90deg, #00f2fe, #4facfe); border: none; color: white; width: 100%; padding: 12px; font-weight: bold; border-radius: 10px; cursor: pointer; font-size: 14px; margin: 10px 0; }
+    .clock-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+    .clock-card { background: #2d2d3a; border-radius: 12px; padding: 15px; border: 1px solid #444; }
+    .clock-title { font-size: 12px; color: #888; font-weight: bold; text-transform: uppercase; }
+    .clock-time { font-size: 20px; color: #00f2fe; font-weight: bold; margin-top: 5px; }
+    .chrono-box { background: #1c1c24; border: 1px solid #333; border-radius: 12px; padding: 20px; }
+    .chrono-digits { font-size: 32px; font-family: monospace; color: #39ff14; font-weight: bold; margin: 10px 0; }
+    .chrono-btns { display: flex; gap: 10px; }
+    .sub-btn { flex: 1; padding: 10px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: white; background: #444; }
+    .active-run { background: #ff3333 !important; }
+    .view-container { display: none; }
+    .view-container.active { display: block; }
+    .cd-input-group { display: flex; justify-content: space-around; gap: 5px; margin: 15px 0; }
+    .cd-field { width: 22%; background: #2d2d3a; border: 1px solid #555; color: #fff; padding: 8px; border-radius: 6px; text-align: center; font-size: 16px; }
+    .metric-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; font-size: 15px; }
+  </style>
+  <script>
+    let activeTabId = 0;
+    let clockSubView = 1;
+
+    function navigateToTab(tabIndex) {
+      activeTabId = tabIndex;
+      fetch('/action?action=setView&target=' + (tabIndex === 0 ? 0 : clockSubView)).then(() => {
+        document.querySelectorAll('.tab-btn').forEach((b, idx) => b.classList.toggle('active', idx === tabIndex));
+        document.querySelectorAll('.tab-content').forEach((c, idx) => c.classList.toggle('active', idx === tabIndex));
+        if(tabIndex === 1) selectClockView(clockSubView);
+      });
+    }
+
+    function selectClockView(viewId) {
+      clockSubView = viewId;
+      fetch('/action?action=setView&target=' + viewId).then(() => {
+        document.querySelectorAll('.sub-tab-btn').forEach((b, idx) => b.classList.toggle('active', idx + 1 === viewId || (viewId===5 && idx===3)));
+        document.querySelectorAll('.view-container').forEach((v, idx) => v.classList.toggle('active', (idx+1===viewId && viewId<5) || (viewId===5 && idx===3)));
+      });
+    }
+
+    function submitCountdown() {
+      let d = document.getElementById('cd-d').value || 0;
+      let h = document.getElementById('cd-h').value || 0;
+      let m = document.getElementById('cd-m').value || 0;
+      let s = document.getElementById('cd-s').value || 0;
+      fetch(`/action?action=setCountdown&d=${d}&h=${h}&m=${m}&s=${s}`);
+    }
+
+    function executeChronoToggle() { fetch('/action?action=toggleChrono'); }
+    function executeChronoReset() { fetch('/action?action=resetChrono'); }
+
+    setInterval(() => {
+      fetch('/status').then(r => r.json()).then(data => {
+        if(activeTabId === 0) {
+          for(let i=1; i<=8; i++) {
+            let card = document.getElementById('p-card-' + i);
+            let dot = document.getElementById('p-dot-' + i);
+            if(card && data['p'+i] === 1) { card.style.borderColor = '#39ff14'; dot.className = "status-dot dot-active"; }
+            else if(card) { card.style.borderColor = '#ff3333'; dot.className = "status-dot dot-inactive"; }
+          }
+        } else {
+          document.getElementById('display-ist').innerText = data.timeIST;
+          document.getElementById('display-est').innerText = data.timeEST;
+          document.getElementById('display-gmt').innerText = data.timeGMT;
+          document.getElementById('display-local').innerText = data.timeLocal;
+          
+          document.getElementById('env-temp').innerText = data.temp + " °C";
+          document.getElementById('env-humid').innerText = data.humid + " %";
+          document.getElementById('env-hi').innerText = data.heatIndex + " °C";
+          document.getElementById('env-dp').innerText = data.dewPoint + " °C";
+          document.getElementById('env-comfort').innerText = data.comfort;
+          document.getElementById('env-aqi').innerText = data.airQual;
+
+          document.getElementById('chrono-val').innerText = `${data.swDays}d ${data.swHours.toString().padStart(2,'0')}:${data.swMins.toString().padStart(2,'0')}:${data.swSecs.toString().padStart(2,'0')}`;
+          document.getElementById('btn-toggle-sw').innerText = data.swRunning === 1 ? "Stop" : "Start";
+
+          let rem = data.cdTotal;
+          if (rem <= 0) {
+            document.getElementById('cd-val').innerText = "FINISHED";
+          } else {
+            let d = Math.floor(rem / 86400); rem %= 86400;
+            let h = Math.floor(rem / 3600);  rem %= 3600;
+            let m = Math.floor(rem / 60);
+            let s = rem % 60;
+            document.getElementById('cd-val').innerText = `${d}d ${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+          }
+        }
+      });
+    }, 600);
+  </script></head>
+  <body>
+    <div class="container">
+      <h2>Quantum Matrix Controller</h2>
+      <div class="tab-nav">
+        <button class="tab-btn active" onclick="navigateToTab(0)">LAN Tester</button>
+        <button class="tab-btn" onclick="navigateToTab(1)">Clock Core</button>
+      </div>
+
+      <div id="tab-lan" class="tab-content active">
+        <div class="pair-container">
+          <div class="pair-title">Pair 1: Transmit (Pins 1 & 2)</div>
+          <div class="grid">
+            <div class="pin-card" id="p-card-1"><div class="wire-stripe w-orange"></div><span id="p-dot-1" class="status-dot dot-inactive"></span>Pin 1</div>
+            <div class="pin-card" id="p-card-2"><div class="wire-stripe orange"></div><span id="p-dot-2" class="status-dot dot-inactive"></span>Pin 2</div>
+          </div>
+        </div>
+        <div class="pair-container">
+          <div class="pair-title">Pair 2: Receive (Pins 3 & 6)</div>
+          <div class="grid">
+            <div class="pin-card" id="p-card-3"><div class="wire-stripe w-green"></div><span id="p-dot-3" class="status-dot dot-inactive"></span>Pin 3</div>
+            <div class="pin-card" id="p-card-6"><div class="wire-stripe green"></div><span id="p-dot-6" class="status-dot dot-inactive"></span>Pin 6</div>
+          </div>
+        </div>
+        <div class="pair-container">
+          <div class="pair-title">Pair 3: Receive (Pins 4 & 5)</div>
+          <div class="grid">
+            <div class="pin-card" id="p-card-4"><div class="wire-stripe w-blue"></div><span id="p-dot-4" class="status-dot dot-inactive"></span>Pin 4</div>
+            <div class="pin-card" id="p-card-5"><div class="wire-stripe blue"></div><span id="p-dot-5" class="status-dot dot-inactive"></span>Pin 5</div>
+          </div>
+        </div>
+        <div class="pair-container">
+          <div class="pair-title">Pair 4: Power/Aux (Pins 7 & 8)</div>
+          <div class="grid">
+            <div class="pin-card" id="p-card-7"><div class="wire-stripe w-brown"></div><span id="p-dot-7" class="status-dot dot-inactive"></span>Pin 7</div>
+            <div class="pin-card" id="p-card-8"><div class="wire-stripe brown"></div><span id="p-dot-8" class="status-dot dot-inactive"></span>Pin 8</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-clock" class="tab-content">
+        <div class="clock-menu">
+          <button class="sub-tab-btn active" onclick="selectClockView(1)">1. Clocks</button>
+          <button class="sub-tab-btn" onclick="selectClockView(2)">2. Chrono</button>
+          <button class="sub-tab-btn" onclick="selectClockView(3)">3. Sensors</button>
+          <button class="sub-tab-btn" onclick="selectClockView(5)">4. Countdown</button>
+          <button class="sub-tab-btn" onclick="selectClockView(4)">5. Sync Time</button>
+
+        </div>
+
+        <div id="view-clocks" class="view-container active">
+          <div class="clock-grid">
+            <div class="clock-card"><div class="clock-title">India (IST)</div><div class="clock-time" id="display-ist">00:00:00</div></div>
+            <div class="clock-card"><div class="clock-title">United States (EST)</div><div class="clock-time" id="display-est">00:00:00</div></div>
+            <div class="clock-card"><div class="clock-title">United Kingdom (GMT)</div><div class="clock-time" id="display-gmt">00:00:00</div></div>
+            <div class="clock-card"><div class="clock-title">Baseline Time</div><div class="clock-time" id="display-local">00:00:00</div></div>
+          </div>
+        </div>
+
+        <div id="view-chrono" class="view-container">
+          <div class="chrono-box">
+            <div class="chrono-digits" id="chrono-val">0d 00:00:00</div>
+            <div class="chrono-btns">
+              <button id="btn-toggle-sw" class="sub-btn" onclick="executeChronoToggle()">Start</button>
+              <button class="sub-btn" onclick="executeChronoReset()">Reset</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="view-sensors" class="view-container">
+          <div class="chrono-box" style="text-align:left;">
+            <div class="metric-row"><span>Temperature:</span><b id="env-temp" style="color:#ff6b35;">--</b></div>
+            <div class="metric-row"><span>Humidity:</span><b id="env-humid" style="color:#4ecdc4;">--</b></div>
+            <div class="metric-row"><span>Heat Index:</span><b id="env-hi" style="color:#ff3333;">--</b></div>
+            <div class="metric-row"><span>Dew Point:</span><b id="env-dp" style="color:#1a8fe3;">--</b></div>
+            <div class="metric-row"><span>Comfort Level:</span><b id="env-comfort" style="color:#00adb5;">--</b></div>
+            <div class="metric-row"><span>Air Quality Est:</span><b id="env-aqi" style="color:#39ff14;">--</b></div>
+          </div>
+        </div>
+
+        <div id="view-countdown" class="view-container">
+          <div class="chrono-box">
+            <div class="chrono-digits" id="cd-val" style="color:#ff3333;">0d 00:00:00</div>
+            <div class="cd-input-group">
+              <input type="number" id="cd-d" class="cd-field" placeholder="Days" min="0">
+              <input type="number" id="cd-h" class="cd-field" placeholder="Hrs" min="0" max="23">
+              <input type="number" id="cd-m" class="cd-field" placeholder="Min" min="0" max="59">
+              <input type="number" id="cd-s" class="cd-field" placeholder="Sec" min="0" max="59">
+            </div>
+            <button class="master-btn" onclick="submitCountdown()">Update Target Value</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </body></html>
+  )=====";
+  server.send(200, "text/html", html);
+}

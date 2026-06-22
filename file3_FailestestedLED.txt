@@ -1,0 +1,371 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Pin Configuration Matrix
+const int lanPins[8] = {16, -1, 5, 4, 0, 2, 14, 12};
+int pinStates[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+#define BUTTON_PIN 0   // D3 (GPIO0) for hardware button control
+#define BUZZER_PIN 15  // D8 (GPIO15) for physical active alarm buzzer
+#define DHTPIN 0       // D3 (GPIO0) data input pin when running sensor mode
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+const char* ssid = "FREE-Utility-Hub";
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+// Application Operating States
+enum SystemMode { MODE_SELECTION, MODE_LAN_SETUP, MODE_LAN_TEST, MODE_CLOCK, MODE_STOPWATCH, MODE_TIMER, MODE_SENSOR };
+SystemMode currentMode = MODE_SELECTION;
+
+// Global Operational Variables
+unsigned long lastTick = 0;
+int hr = 12, mn = 0, sc = 0; 
+unsigned long stopwatchElapsed = 0;
+bool stopwatchRunning = false;
+unsigned long stopwatchStart = 0;
+
+long timerSeconds = 0;
+bool timerRunning = false;
+unsigned long timerStartMillis = 0;
+
+float temperature = 0.0, humidity = 0.0;
+
+// Function Declarations
+void configureLanPins();
+void updateOledDisplay();
+void checkPhysicalButton();
+void readPins();
+void handleRoot();
+void handleStatus();
+void handleAction();
+void handleRedirect();
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Initialize I2C OLED (SDA=D2, SCL=D1)
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("OLED screen initialization failed."));
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,10);
+  display.println("Initializing Hub...");
+  display.display();
+
+  configureLanPins();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid);
+  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/action", handleAction);
+  server.onNotFound(handleRedirect);
+  
+  server.begin();
+  dht.begin();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  
+  // Real-Time clock local tracker
+  if (millis() - lastTick >= 1000) {
+    lastTick = millis();
+    sc++;
+    if (sc >= 60) { sc = 0; mn++; }
+    if (mn >= 60) { mn = 0; hr++; }
+    if (hr >= 24) { hr = 0; }
+    
+    if (currentMode == MODE_SENSOR) {
+      humidity = dht.readHumidity();
+      temperature = dht.readTemperature();
+    }
+  }
+
+  // Monitor Timer expiration
+  if (timerRunning) {
+    long currentElapsed = (millis() - timerStartMillis) / 1000;
+    if (currentElapsed >= timerSeconds) {
+      timerRunning = false;
+      timerSeconds = 0;
+      digitalWrite(BUZZER_PIN, HIGH);
+    }
+  }
+
+  updateOledDisplay();
+  checkPhysicalButton();
+}
+
+void configureLanPins() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] != -1 && lanPins[i] != 4 && lanPins[i] != 5) {
+      pinMode(lanPins[i], (currentMode == MODE_LAN_TEST) ? INPUT_PULLUP : INPUT); 
+    }
+  }
+}
+
+void checkPhysicalButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(200); 
+    digitalWrite(BUZZER_PIN, LOW); 
+    if (currentMode == MODE_STOPWATCH) {
+      stopwatchRunning = !stopwatchRunning;
+      if (stopwatchRunning) stopwatchStart = millis() - stopwatchElapsed;
+    }
+  }
+}
+
+void updateOledDisplay() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  
+  switch(currentMode) {
+    case MODE_SELECTION:
+      display.println("== PORTAL CHOICE ==");
+      display.println("\nSelect an option");
+      display.println("on your screen...");
+      break;
+    case MODE_LAN_SETUP:
+      display.println("== LAN TESTING ==");
+      display.println("\n[Setup Your Cable]");
+      display.println("Press 'Start Test'");
+      display.println("on GUI webpage.");
+      break;
+    case MODE_LAN_TEST:
+      display.println("LIVE LAN MATRIX");
+      display.println("--------------------");
+      readPins();
+      for(int i=0; i<8; i++) {
+        display.print("P"); display.print(i+1); display.print(":");
+        display.print(pinStates[i] ? "LIVE  " : "OPEN  ");
+        if(i == 3 || i == 7) display.println();
+      }
+      break;
+    case MODE_CLOCK:
+      display.println("DIGITAL CLOCK");
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      if(hr<10) display.print("0"); display.print(hr); display.print(":");
+      if(mn<10) display.print("0"); display.print(mn); display.print(":");
+      if(sc<10) display.print("0"); display.print(sc);
+      break;
+    case MODE_STOPWATCH:
+      display.println("STOPWATCH");
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      {
+        unsigned long t = stopwatchRunning ? (millis() - stopwatchStart) : stopwatchElapsed;
+        unsigned long s = (t / 1000) % 60;
+        unsigned long m = (t / 60000);
+        display.print(m); display.print("m ");
+        display.print(s); display.print("s");
+      }
+      break;
+    case MODE_TIMER:
+      display.println("TIMER MODE");
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      if (timerRunning) {
+        long remaining = timerSeconds - ((millis() - timerStartMillis)/1000);
+        display.print(remaining > 0 ? remaining : 0); display.print("s Left");
+      } else {
+        display.print("Idle/Stopped");
+      }
+      break;
+    case MODE_SENSOR:
+      display.println("ENVIRONMENT DATA");
+      display.println("--------------------");
+      display.print("Temp: "); display.print(isnan(temperature) ? 0 : temperature); display.println(" C");
+      display.print("Humid: "); display.print(isnan(humidity) ? 0 : humidity); display.println(" %");
+      break;
+  }
+  display.display();
+}
+
+void readPins() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] == -1) pinStates[i] = 1;
+    else if (lanPins[i] == 4 || lanPins[i] == 5) pinStates[i] = 0; 
+    else pinStates[i] = (digitalRead(lanPins[i]) == LOW) ? 1 : 0;
+  }
+}
+
+void handleStatus() {
+  readPins();
+  String json = "{";
+  json += "\"mode\":" + String(currentMode) + ",";
+  json += "\"temp\":" + String(temperature) + ",";
+  json += "\"humid\":" + String(humidity) + ",";
+  for(int i = 0; i < 8; i++) {
+    json += "\"p" + String(i+1) + "\":" + String(pinStates[i]) + ",";
+  }
+  json += "\"time\":\"" + String(hr) + ":" + String(mn) + ":" + String(sc) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleRedirect() {
+  server.sendHeader("Location", String("http://192.168.4.1/"), true);
+  server.send(302, "text/plain", "");
+}
+
+void handleAction() {
+  String act = server.arg("action");
+  if (act == "setMode") {
+    currentMode = (SystemMode)server.arg("target").toInt();
+    configureLanPins();
+  }
+  else if (act == "setTime") {
+    hr = server.arg("h").toInt();
+    mn = server.arg("m").toInt();
+    sc = server.arg("s").toInt();
+  }
+  else if (act == "startTimer") {
+    timerSeconds = server.arg("sec").toInt();
+    timerStartMillis = millis();
+    timerRunning = true;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  else if (act == "resetStopwatch") {
+    stopwatchElapsed = 0;
+    stopwatchRunning = false;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleRoot() {
+  String html = R"=====(
+  <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Elite Diagnostic Hub</title>
+  <style>
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: linear-gradient(135deg, #0f0c20 0%, #15102a 50%, #06040a 100%); min-height: 100vh; color: #fff; padding: 15px; margin: 0; display: flex; align-items: center; justify-content: center; }
+    .container { width: 100%; max-width: 480px; background: rgba(30, 25, 50, 0.65); backdrop-filter: blur(14px); padding: 25px; border-radius: 24px; border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 20px 50px rgba(0,0,0,0.6); box-sizing: border-box; }
+    h2 { margin-top: 0; margin-bottom: 20px; font-weight: 700; background: linear-gradient(90deg, #00f2fe, #4facfe); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 24px; letter-spacing: -0.5px; }
+    .menu-btn { display: block; width: 100%; padding: 16px; margin: 12px 0; background: linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01)); color: #e0e0ed; border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.25s ease; text-align: left; position: relative; box-sizing: border-box;}
+    .menu-btn:hover { background: linear-gradient(90deg, #0072ff, #00c6ff); border-color: transparent; color: #fff; transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,114,255,0.3); }
+    .panel { display: none; background: rgba(10, 8, 18, 0.7); padding: 20px; border-radius: 18px; border: 1px solid rgba(255,255,255,0.05); margin-top: 20px; box-sizing: border-box;}
+    .active-panel { display: block; animation: fadeIn 0.4s ease; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 15px; }
+    .pin-card { padding: 16px; border-radius: 12px; font-size: 14px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); font-weight: bold; transition: background 0.3s; text-align: center; }
+    input { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.2); color: #fff; text-align: center; font-size: 16px; margin-bottom: 15px; box-sizing: border-box; }
+    .action-btn { width: 100%; padding: 14px; background: linear-gradient(90deg, #00f2fe, #4facfe); border: none; color: #fff; font-weight: 700; font-size: 15px; border-radius: 12px; cursor: pointer; transition: opacity 0.2s; box-sizing: border-box; }
+    .action-btn:hover { opacity: 0.9; }
+    .setup-box { padding: 20px; border: 1px dashed rgba(255,255,255,0.2); border-radius: 12px; margin-bottom: 15px; background: rgba(255,255,255,0.01); }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+  <script>
+    function changeMode(modeId) {
+      fetch('/action?action=setMode&target=' + modeId).then(() => {
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active-panel'));
+        if(modeId == 1) document.getElementById('lan-setup-panel').classList.add('active-panel');
+        if(modeId == 2) { document.getElementById('clock-panel').classList.add('active-panel'); syncClock(); }
+        if(modeId == 3) document.getElementById('stopwatch-panel').classList.add('active-panel');
+        if(modeId == 4) document.getElementById('timer-panel').classList.add('active-panel');
+        if(modeId == 5) document.getElementById('sensor-panel').classList.add('active-panel');
+        if(modeId == 6) document.getElementById('lan-test-panel').classList.add('active-panel');
+      });
+    }
+    function syncClock() {
+      let d = new Date();
+      fetch(`/action?action=setTime&h=${d.getHours()}&m=${d.getMinutes()}&s=${d.getSeconds()}`);
+    }
+    function startTimer() {
+      let s = document.getElementById('timerSec').value;
+      fetch(`/action?action=startTimer&sec=` + s);
+    }
+    setInterval(() => {
+      fetch('/status').then(r => r.json()).then(data => {
+        document.getElementById('clock-display').innerText = data.time;
+        document.getElementById('temp-val').innerText = data.temp + " °C";
+        document.getElementById('hum-val').innerText = data.humid + " %";
+        for(let i=1; i<=8; i++) {
+          let card = document.getElementById('card-p'+i);
+          if(card) {
+            card.style.background = data['p'+i] == 1 ? 'linear-gradient(135deg, #00b4db, #0083b0)' : 'linear-gradient(135deg, #fe2471, #f9002f)';
+            card.style.borderColor = 'transparent';
+          }
+        }
+      });
+    }, 500);
+  </script></head>
+  <body>
+    <div class="container">
+      <h2>Elite Utility Hub</h2>
+      <button class="menu-btn" onclick="changeMode(1)">⚡ 1. LAN Wire Cable Tester</button>
+      <button class="menu-btn" onclick="changeMode(2)">🕒 2. Sync & View Clock Time</button>
+      <button class="menu-btn" onclick="changeMode(3)">⏱️ 3. Digital Stopwatch</button>
+      <button class="menu-btn" onclick="changeMode(4)">🔔 4. Countdown Timer Alarm</button>
+      <button class="menu-btn" onclick="changeMode(5)">🌱 5. Environmental Sensors</button>
+
+      <div id="lan-setup-panel" class="panel">
+        <h3>LAN Diagnostic Initialization</h3>
+        <div class="setup-box">
+          <p style="margin:0 0 10px 0; color:#00f2fe; font-weight:bold;">⚠️ Action Required</p>
+          <p style="margin:0; font-size:14px; color:#aaa; line-height:1.5;">Please safely bridge or attach your RJ45 modular cable interface to the designated pin array block now.</p>
+        </div>
+        <button class="action-btn" onclick="changeMode(6)">Start Testing Matrix</button>
+      </div>
+
+      <div id="lan-test-panel" class="panel">
+        <h3>Live Cable Matrix</h3>
+        <div class="grid">
+          <div id="card-p1" class="pin-card">Pin 1</div><div id="card-p2" class="pin-card">Pin 2</div>
+          <div id="card-p3" class="pin-card">Pin 3</div><div id="card-p4" class="pin-card">Pin 4</div>
+          <div id="card-p5" class="pin-card">Pin 5</div><div id="card-p6" class="pin-card">Pin 6</div>
+          <div id="card-p7" class="pin-card">Pin 7</div><div id="card-p8" class="pin-card">Pin 8</div>
+        </div>
+        <br>
+        <button class="action-btn" style="background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2);" onclick="changeMode(1)">Disconnect / Reset</button>
+      </div>
+
+      <div id="clock-panel" class="panel">
+        <h3>Synced System Time</h3>
+        <h1 id="clock-display" style="color:#00adb5; font-size:42px; margin:15px 0;">00:00:00</h1>
+        <button class="action-btn" onclick="syncClock()">Force Time Sync</button>
+      </div>
+
+      <div id="stopwatch-panel" class="panel">
+        <h3>Stopwatch Mode</h3>
+        <p style="color:#aaa; font-size:14px;">Press the physical toggle button wired to <b>D3</b> to start/stop tracking.</p>
+        <button class="action-btn" onclick="fetch('/action?action=resetStopwatch')">Reset Counter</button>
+      </div>
+
+      <div id="timer-panel" class="panel">
+        <h3>Set Countdown Timer</h3>
+        <input type="number" id="timerSec" placeholder="Enter Duration in Seconds" />
+        <button class="action-btn" onclick="startTimer()">Begin Countdown</button>
+      </div>
+
+      <div id="sensor-panel" class="panel">
+        <h3>Microclimate Telemetry</h3>
+        <p style="color:#888; font-size:12px;">Bus shared configuration utilizing pin <b>D3</b></p>
+        <h2 style="-webkit-text-fill-color:unset; color:#fff;">Temperature: <span id="temp-val" style="color:#00f2fe;">--</span></h2>
+        <h2 style="-webkit-text-fill-color:unset; color:#fff;">Humidity: <span id="hum-val" style="color:#4facfe;">--</span></h2>
+      </div>
+    </div>
+  </body></html>
+  )=====";
+  server.send(200, "text/html", html);
+}

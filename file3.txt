@@ -1,0 +1,340 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Pin Mappings
+const int lanPins[8] = {16, -1, 5, 4, 0, 2, 14, 12};
+int pinStates[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+#define BUTTON_PIN 0   // D3 (GPIO0) for Mode switching / Button interactions
+#define BUZZER_PIN 15  // D8 (GPIO15) for Timer Alarm Output
+#define DHTPIN 0       // Reuses D3 (GPIO0) for DHT Data line when in Sensor Mode
+#define DHTTYPE DHT11  // Change to DHT22 if using a white DHT sensor
+DHT dht(DHTPIN, DHTTYPE);
+
+const char* ssid = "FREE-Utility-Hub";
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+// App States
+enum SystemMode { MODE_SELECTION, MODE_LAN, MODE_CLOCK, MODE_STOPWATCH, MODE_TIMER, MODE_SENSOR };
+SystemMode currentMode = MODE_SELECTION;
+
+// Time & Utility Variables
+unsigned long lastTick = 0;
+int hr = 12, mn = 0, sc = 0; // Manual Time tracking via local AP configurations
+unsigned long stopwatchElapsed = 0;
+bool stopwatchRunning = false;
+unsigned long stopwatchStart = 0;
+
+long timerSeconds = 0;
+bool timerRunning = false;
+unsigned long timerStartMillis = 0;
+
+float temperature = 0.0, humidity = 0.0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Initialize OLED (Pins D1 & D2)
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("SSD1306 allocation failed"));
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,10);
+  display.println("System Booting...");
+  display.display();
+
+  // Initialize LAN inputs dynamically based on state
+  configureLanPins();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid);
+  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/action", handleAction);
+  
+  server.onNotFound([]() {
+    server.sendHeader("Location", String("http://192.168.4.1/"), true);
+    server.send(302, "text/plain", "");
+  });
+  
+  server.begin();
+  dht.begin();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  
+  // Local Clock Tick (1 Second)
+  if (millis() - lastTick >= 1000) {
+    lastTick = millis();
+    sc++;
+    if (sc >= 60) { sc = 0; mn++; }
+    if (mn >= 60) { mn = 0; hr++; }
+    if (hr >= 24) { hr = 0; }
+    
+    // Read sensor if currently running sensor tab
+    if (currentMode == MODE_SENSOR) {
+      humidity = dht.readHumidity();
+      temperature = dht.readTemperature();
+    }
+  }
+
+  // Handle Timer Countdowns
+  if (timerRunning) {
+    long currentElapsed = (millis() - timerStartMillis) / 1000;
+    if (currentElapsed >= timerSeconds) {
+      timerRunning = false;
+      timerSeconds = 0;
+      digitalWrite(BUZZER_PIN, HIGH); // Alarm Triggered!
+    }
+  }
+
+  updateOledDisplay();
+  checkPhysicalButton();
+}
+
+void configureLanPins() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] != -1 && lanPins[i] != 4 && lanPins[i] != 5) { // Skip OLED I2C lines
+      pinMode(lanPins[i], (currentMode == MODE_LAN) ? INPUT_PULLUP : INPUT); 
+    }
+  }
+}
+
+void checkPhysicalButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(200); // Debounce
+    digitalWrite(BUZZER_PIN, LOW); // Silences alarm if sounding
+    if (currentMode == MODE_STOPWATCH) {
+      stopwatchRunning = !stopwatchRunning;
+      if (stopwatchRunning) stopwatchStart = millis() - stopwatchElapsed;
+    }
+  }
+}
+
+void updateOledDisplay() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  
+  switch(currentMode) {
+    case MODE_SELECTION:
+      display.println("--- UTILITY HUB ---");
+      display.println("\nWaiting for client...");
+      display.println("Connect to WiFi Network:");
+      display.println("FREE-LAN-Tester");
+      break;
+    case MODE_LAN:
+      display.println("MODE: LAN TESTER");
+      display.println("\nChecking Wires...");
+      readPins();
+      for(int i=0; i<8; i++) {
+        display.print("P"); display.print(i+1); display.print(":");
+        display.print(pinStates[i] ? "L " : "O ");
+        if(i == 3) display.println();
+      }
+      break;
+    case MODE_CLOCK:
+      display.println("MODE: DIGITAL CLOCK");
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      if(hr<10) display.print("0"); display.print(hr); display.print(":");
+      if(mn<10) display.print("0"); display.print(mn); display.print(":");
+      if(sc<10) display.print("0"); display.print(sc);
+      break;
+    case MODE_STOPWATCH:
+      display.println("MODE: STOPWATCH");
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      {
+        unsigned long t = stopwatchRunning ? (millis() - stopwatchStart) : stopwatchElapsed;
+        unsigned long ms = t % 1000;
+        unsigned long s = (t / 1000) % 60;
+        unsigned long m = (t / 60000);
+        display.print(m); display.print("m ");
+        display.print(s); display.print("s");
+      }
+      break;
+    case MODE_TIMER:
+      display.println("MODE: COUNTDOWN TIMER");
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      if (timerRunning) {
+        long remaining = timerSeconds - ((millis() - timerStartMillis)/1000);
+        display.print(remaining > 0 ? remaining : 0); display.print("s Left");
+      } else {
+        display.print("Ready / Idle");
+      }
+      break;
+    case MODE_SENSOR:
+      display.println("MODE: ENVIRONMENT SENSOR");
+      display.println("\nReusing Pins for Data Stream");
+      display.print("Temp: "); display.print(isnan(temperature) ? 0 : temperature); display.println(" C");
+      display.print("Humid: "); display.print(isnan(humidity) ? 0 : humidity); display.println(" %");
+      break;
+  }
+  display.display();
+}
+
+void readPins() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] == -1) pinStates[i] = 1;
+    else if (lanPins[i] == 4 || lanPins[i] == 5) pinStates[i] = 0; // Safe-guarding display lines
+    else pinStates[i] = (digitalRead(lanPins[i]) == LOW) ? 1 : 0;
+  }
+}
+
+void handleStatus() {
+  readPins();
+  String json = "{";
+  json += "\"mode\":" + String(currentMode) + ",";
+  json += "\"temp\":" + String(temperature) + ",";
+  json += "\"humid\":" + String(humidity) + ",";
+  for(int i = 0; i < 8; i++) {
+    json += "\"p" + String(i+1) + "\":" + String(pinStates[i]) + ",";
+  }
+  json += "\"time\":\"" + String(hr) + ":" + String(mn) + ":" + String(sc) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleAction() {
+  String act = server.arg("action");
+  if (act == "setMode") {
+    currentMode = (SystemMode)server.arg("target").toInt();
+    configureLanPins();
+  }
+  else if (act == "setTime") {
+    hr = server.arg("h").toInt();
+    mn = server.arg("m").toInt();
+    sc = 0;
+  }
+  else if (act == "startTimer") {
+    timerSeconds = server.arg("sec").toInt();
+    timerStartMillis = millis();
+    timerRunning = true;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  else if (act == "resetStopwatch") {
+    stopwatchElapsed = 0;
+    stopwatchRunning = false;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleRoot() {
+  String html = R"=====(
+  <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Unified Toolkit Hub</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; text-align: center; background: #141419; color: #fff; padding: 10px; margin: 0; }
+    .container { max-width: 500px; margin: 15px auto; background: #22222b; padding: 20px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    h2 { margin-bottom: 15px; color: #00adb5; }
+    .menu-btn { display: block; width: 100%; padding: 15px; margin: 10px 0; background: #2d2d3a; color: #fff; border: 2px solid #444; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+    .menu-btn:hover { background: #00adb5; border-color: #00adb5; }
+    .panel { display: none; background: #1c1c24; padding: 15px; border-radius: 10px; border: 1px solid #333; margin-top: 15px; }
+    .active-panel { display: block; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .pin-card { padding: 12px; border-radius: 6px; background: #2d2d3a; border: 1px solid #555; font-weight: bold;}
+    input { width: 70%; padding: 8px; margin: 8px; border-radius: 4px; border: 1px solid #444; background: #2d2d3a; color: #fff; text-align: center; }
+    .action-btn { padding: 8px 15px; background: #00adb5; border: none; color: #fff; font-weight: bold; border-radius: 4px; cursor: pointer; }
+  </style>
+  <script>
+    function changeMode(modeId) {
+      fetch('/action?action=setMode&target=' + modeId).then(() => {
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active-panel'));
+        if(modeId == 1) document.getElementById('lan-panel').classList.add('active-panel');
+        if(modeId == 2) document.getElementById('clock-panel').classList.add('active-panel');
+        if(modeId == 3) document.getElementById('stopwatch-panel').classList.add('active-panel');
+        if(modeId == 4) document.getElementById('timer-panel').classList.add('active-panel');
+        if(modeId == 5) document.getElementById('sensor-panel').classList.add('active-panel');
+      });
+    }
+    function sendTime() {
+      let d = new Date();
+      fetch(`/action?action=setTime&h=${d.getHours()}&m=${d.getMinutes()}`);
+    }
+    function startTimer() {
+      let s = document.getElementById('timerSec').value;
+      fetch(`/action?action=startTimer&sec=` + s);
+    }
+    setInterval(() => {
+      fetch('/status').then(r => r.json()).then(data => {
+        document.getElementById('clock-display').innerText = data.time;
+        document.getElementById('temp-val').innerText = data.temp + " C";
+        document.getElementById('hum-val').innerText = data.humid + " %";
+        for(let i=1; i<=8; i++) {
+          let card = document.getElementById('card-p'+i);
+          if(card) card.style.background = data['p'+i] == 1 ? '#2ec4b6' : '#e71d36';
+        }
+      });
+    }, 500);
+  </script></head>
+  <body>
+    <div class="container">
+      <h2>Unified Utility Hub</h2>
+      <button class="menu-btn" onclick="changeMode(1)">1. LAN Wire Cable Tester</button>
+      <button class="menu-btn" onclick="changeMode(2); sendTime()">2. View Current Clock Time</button>
+      <button class="menu-btn" onclick="changeMode(3)">3. Digital Stopwatch</button>
+      <button class="menu-btn" onclick="changeMode(4)">4. Countdown Timer (Buzzer Output)</button>
+      <button class="menu-btn" onclick="changeMode(5)">5. Environmental Sensor Suite</button>
+
+      <div id="lan-panel" class="panel">
+        <h3>Live Cable Matrix</h3>
+        <div class="grid">
+          <div id="card-p1" class="pin-card">Pin 1</div><div id="card-p2" class="pin-card">Pin 2</div>
+          <div id="card-p3" class="pin-card">Pin 3</div><div id="card-p4" class="pin-card">Pin 4</div>
+          <div id="card-p5" class="pin-card">Pin 5</div><div id="card-p6" class="pin-card">Pin 6</div>
+          <div id="card-p7" class="pin-card">Pin 7</div><div id="card-p8" class="pin-card">Pin 8</div>
+        </div>
+      </div>
+
+      <div id="clock-panel" class="panel">
+        <h3>Current Local Time</h3>
+        <h1 id="clock-display" style="color:#00adb5;">00:00:00</h1>
+        <button class="action-btn" onclick="sendTime()">Sync Phone Time</button>
+      </div>
+
+      <div id="stopwatch-panel" class="panel">
+        <h3>Stopwatch Mode</h3>
+        <p>Press the physical button on <b>D3</b> to Start / Stop.</p>
+        <button class="action-btn" onclick="fetch('/action?action=resetStopwatch')">Reset</button>
+      </div>
+
+      <div id="timer-panel" class="panel">
+        <h3>Set Countdown Timer</h3>
+        <input type="number" id="timerSec" placeholder="Seconds (e.g. 10)" /><br><br>
+        <button class="action-btn" onclick="startTimer()">Start Countdown</button>
+      </div>
+
+      <div id="sensor-panel" class="panel">
+        <h3>DHT11 Environmental Output</h3>
+        <p>Ensure data line is shared on pin <b>D3</b></p>
+        <h2>Temperature: <span id="temp-val">--</span></h2>
+        <h2>Humidity: <span id="hum-val">--</span></h2>
+      </div>
+    </div>
+  </body></html>
+  )=====";
+  server.send(200, "text/html", html);
+}

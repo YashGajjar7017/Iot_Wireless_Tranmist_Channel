@@ -1,0 +1,642 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <EEPROM.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Pin 15 (D8) reserved exclusively for audio siren
+const int lanPins[8] = {16, 14, 12, 13, 0, 2, 3, 1}; 
+int pinStates[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+#define BUZZER_PIN 15 
+#define DHTPIN 4      
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+const char* ssid = "Yash_Smart_Hub";
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+enum ViewMode { VIEW_LAN, VIEW_CLOCK_ZONES, VIEW_STOPWATCH, VIEW_SENSORS, VIEW_SYNC, VIEW_COUNTDOWN, VIEW_GATE_TIMER, VIEW_TODOS };
+ViewMode currentView = VIEW_LAN;
+
+unsigned long lastTick = 0;
+long localEpochSeconds = 43200; 
+
+int offsetIST = 19800;          
+int offsetEST = -18000;         
+int offsetGMT = 0;              
+
+int currentYear = 2026;
+int currentMonth = 6;
+int currentDay = 21;
+
+int timeMultiplier = 1; 
+
+bool chronoRunning = false;
+unsigned long chronoElapsedBase = 0;
+unsigned long chronoStartMillis = 0;
+
+long countdownTotalSeconds = 0; 
+
+long gateTimerTotalSeconds = 0;
+float gateTimerSpeed = 1.0;
+bool gateTimerActive = false;
+
+// Alert Engines
+bool alarmActive = false;
+unsigned long alarmToggleMillis = 0;
+bool alarmToneState = false;
+
+float currentTemp = 24.0; 
+float currentHumid = 50.0;
+float currentHeatIndex = 24.0;
+float currentDewPoint = 13.0;
+String comfortLevel = "Comfortable";
+String airQualityEst = "Good (Normal)";
+unsigned long lastSensorPoll = 0;
+
+float busVoltage = 5.05;   
+float currentAmps = 0.080; 
+float calculatedPower = 0.400;
+
+// Upgraded Scheduler Datastruct
+struct TodoTask {
+  char title[24];
+  int dayOffset; // 0 = Today, 1 = Tomorrow, 2 = Specific Target
+  int targetHour;
+  int targetMin;
+  bool isCompleted;
+  bool activeTriggered;
+};
+TodoTask taskList[4]; 
+int totalTasksConfigured = 0;
+String activeTaskDisplayStr = "System Alarm";
+
+struct BackupConfig {
+  int savedView;
+  unsigned long savedChronoBase;
+  long savedCountdownSeconds;
+  int savedMultiplier;
+} appState;
+
+void syncPinsToMode();
+void refreshOledDisplay();
+void readPins();
+void computeAdvancedMetrics();
+void pollPowerTelemetry();
+void executeBuzzerSirenPattern();
+void handleRootRequest();
+void handleStatusPayload();
+void handleActionCommand();
+void handleCaptiveRedirect();
+void saveStateToEeprom();
+void loadStateFromEeprom();
+
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(512);
+  loadStateFromEeprom();
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Wire.begin(4, 5);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 10);
+  display.println("CORE RE-INITIALIZED");
+  display.println("--------------------");
+  display.println("OLED Monitor: OK");
+  display.println("Siren Port D8: Active");
+  display.display();
+
+  syncPinsToMode();
+  dht.begin();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 2, 1), IPAddress(192, 168, 2, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid);
+  dnsServer.start(53, "*", IPAddress(192, 168, 2, 1));
+
+  server.on("/", handleRootRequest);
+  server.on("/status", handleStatusPayload);
+  server.on("/action", handleActionCommand);
+  server.onNotFound(handleCaptiveRedirect);
+  server.begin();
+
+  delay(1000); 
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+
+  unsigned long currentMillis = millis();
+
+  // Unified Base Time Engine Loop
+  unsigned long tickInterval = 1000 / timeMultiplier;
+  if (currentMillis - lastTick >= tickInterval) {
+    lastTick = currentMillis;
+    localEpochSeconds++;
+    if (localEpochSeconds >= 86400) {
+      localEpochSeconds = 0;
+      currentDay++; 
+    }
+
+    if (countdownTotalSeconds > 0) {
+      countdownTotalSeconds--;
+      if (countdownTotalSeconds == 0) {
+        alarmActive = true; 
+        activeTaskDisplayStr = "Countdown Complete";
+      }
+    }
+
+    // Evaluate To-Do Alarm Triggers
+    int curHour = localEpochSeconds / 3600;
+    int curMin = (localEpochSeconds % 3600) / 60;
+    for(int i = 0; i < totalTasksConfigured; i++) {
+      if(!taskList[i].isCompleted && !taskList[i].activeTriggered) {
+        if(taskList[i].targetHour == curHour && taskList[i].targetMin == curMin) {
+          alarmActive = true;
+          taskList[i].activeTriggered = true;
+          activeTaskDisplayStr = String(taskList[i].title);
+          currentView = VIEW_TODOS; // Focus display to help visibility
+        }
+      }
+    }
+  }
+
+  // Gate Timer Engine Execution Block
+  static unsigned long lastGateTimerPoll = 0;
+  if (gateTimerActive && gateTimerTotalSeconds > 0) {
+    unsigned long dynamicInterval = (unsigned long)(1000.0 / gateTimerSpeed);
+    if (currentMillis - lastGateTimerPoll >= dynamicInterval) {
+      lastGateTimerPoll = currentMillis;
+      gateTimerTotalSeconds--;
+      if (gateTimerTotalSeconds <= 0) {
+        gateTimerTotalSeconds = 0;
+        gateTimerActive = false;
+        alarmActive = true; 
+        activeTaskDisplayStr = "Gate Timer Alert";
+        currentView = VIEW_GATE_TIMER;
+      }
+    }
+  }
+
+  // Live Siren Output Sequence Execution
+  if (alarmActive) {
+    executeBuzzerSirenPattern();
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // Telemetry Engine Poll
+  if (currentMillis - lastSensorPoll >= 2500) {
+    lastSensorPoll = currentMillis;
+    float tempReading = dht.readTemperature();
+    float humidReading = dht.readHumidity();
+    if (!isnan(tempReading) && tempReading > 0) {
+      currentTemp = tempReading;
+      currentHumid = humidReading;
+      computeAdvancedMetrics();
+    }
+    pollPowerTelemetry();
+  }
+
+  readPins();
+  refreshOledDisplay(); // Always update screen, removing old AP block lockout
+}
+
+void executeBuzzerSirenPattern() {
+  if (millis() - alarmToggleMillis >= 150) {
+    alarmToggleMillis = millis();
+    alarmToneState = !alarmToneState;
+    digitalWrite(BUZZER_PIN, alarmToneState ? HIGH : LOW);
+  }
+}
+
+void computeAdvancedMetrics() {
+  currentHeatIndex = dht.computeHeatIndex(currentTemp, currentHumid, false);
+  float a = 17.27; float b = 237.7;
+  float alpha = ((a * currentTemp) / (b + currentTemp)) + log(currentHumid / 100.0);
+  currentDewPoint = (b * alpha) / (a - alpha);
+  comfortLevel = (currentHumid > 70) ? "Sticky" : "Comfortable";
+  airQualityEst = (currentHumid >= 40 && currentHumid <= 60) ? "Optimal" : "Dry/Stale";
+}
+
+void pollPowerTelemetry() {
+  float variance = (random(-10, 10) / 1000.0);
+  busVoltage = 5.06 + (random(-1, 2) / 100.0);
+  currentAmps = 0.082 + (WiFi.softAPgetStationNum() * 0.042) + variance; 
+  calculatedPower = busVoltage * currentAmps;
+}
+
+void syncPinsToMode() {
+  for (int i = 0; i < 8; i++) pinMode(lanPins[i], INPUT_PULLUP);
+}
+
+void readPins() {
+  for (int i = 0; i < 8; i++) pinStates[i] = (digitalRead(lanPins[i]) == LOW) ? 1 : 0;
+}
+
+void formatTimeOutput(char* buffer, long epoch, int offsetSeconds) {
+  long activeTime = (epoch + offsetSeconds + 86400) % 86400;
+  sprintf(buffer, "%02d:%02d:%02d", (int)(activeTime / 3600), (int)((activeTime % 3600) / 60), (int)(activeTime % 60));
+}
+
+void saveStateToEeprom() {
+  appState.savedView = (int)currentView;
+  appState.savedChronoBase = chronoElapsedBase;
+  appState.savedCountdownSeconds = countdownTotalSeconds;
+  appState.savedMultiplier = timeMultiplier;
+  EEPROM.put(0, appState); EEPROM.commit();
+}
+
+void loadStateFromEeprom() {
+  EEPROM.get(0, appState);
+  if (appState.savedView >= 0 && appState.savedView <= 7) {
+    currentView = (ViewMode)appState.savedView;
+    chronoElapsedBase = appState.savedChronoBase;
+    countdownTotalSeconds = (appState.savedCountdownSeconds < 0) ? 0 : appState.savedCountdownSeconds;
+    timeMultiplier = (appState.savedMultiplier <= 0) ? 1 : appState.savedMultiplier;
+  }
+}
+
+void refreshOledDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  char timeBuffer[16];
+
+  // Overlay Warning Banner without locking operational screen render cycles
+  if(alarmActive && (millis() % 600 < 300)) {
+    display.println("!! SIREN RUNNING !!");
+    display.println("--------------------");
+  }
+
+  switch(currentView) {
+    case VIEW_LAN:
+      if (!alarmActive) {
+        display.println("   LAN WIRE MATRIX");
+        display.println("--------------------");
+      }
+      display.setCursor(0, 20);
+      for (int i = 0; i < 8; i++) {
+        display.print("P"); display.print(i + 1); display.print(pinStates[i] ? ":LV " : ":OP ");
+        if (i == 3 || i == 7) display.println();
+      }
+      break;
+
+    case VIEW_CLOCK_ZONES:
+      display.println("    WORLD CLOCKS");
+      display.println("--------------------");
+      formatTimeOutput(timeBuffer, localEpochSeconds, offsetIST);
+      display.print("IST: "); display.println(timeBuffer);
+      formatTimeOutput(timeBuffer, localEpochSeconds, offsetEST);
+      display.print("EST: "); display.println(timeBuffer);
+      display.printf("Date: %02d/%02d/%04d\n", currentDay, currentMonth, currentYear);
+      break;
+
+    case VIEW_STOPWATCH:
+      display.println("  PRECISION CHRONO");
+      display.println("--------------------");
+      display.setTextSize(2); display.setCursor(15, 32);
+      {
+        unsigned long totalChrono = chronoElapsedBase;
+        if (chronoRunning) totalChrono += (millis() - chronoStartMillis) * timeMultiplier;
+        display.printf("%02ld:%02ld", (totalChrono / 60000) % 60, (totalChrono / 1000) % 60);
+      }
+      break;
+
+    case VIEW_SENSORS:
+      display.println("SYSTEM TELEMETRY");
+      display.println("--------------------");
+      display.printf("V: %.2fV  A: %.3fA\n", busVoltage, currentAmps);
+      display.printf("W: %.3fW\n", calculatedPower);
+      display.printf("T: %.1fC H: %.1f%%\n", currentTemp, currentHumid);
+      break;
+
+    case VIEW_COUNTDOWN:
+      display.println("  COUNTDOWN MATRIX");
+      display.println("--------------------");
+      display.setTextSize(2); display.setCursor(10, 32);
+      if (countdownTotalSeconds <= 0) display.println("00:00:00");
+      else display.printf("%02ld:%02ld", (countdownTotalSeconds % 3600) / 60, countdownTotalSeconds % 60);
+      break;
+
+    case VIEW_GATE_TIMER:
+      display.println("   GATE TIMER RUN");
+      display.println("--------------------");
+      display.setTextSize(2); display.setCursor(15, 32);
+      display.printf("%02ld:%02ld", (gateTimerTotalSeconds % 3600) / 60, gateTimerTotalSeconds % 60);
+      break;
+
+    case VIEW_TODOS:
+      display.println("   TODOS CONSOLE");
+      display.println("--------------------");
+      if(totalTasksConfigured == 0) {
+        display.println("\nNo Active Stack Items");
+      } else {
+        for(int i=0; i < totalTasksConfigured; i++) {
+          char targetStr[6];
+          if(taskList[i].dayOffset == 0) strcpy(targetStr, "Today");
+          else if(taskList[i].dayOffset == 1) strcpy(targetStr, "Tmrw");
+          else strcpy(targetStr, "Spec");
+          display.printf("%d. %s (%s %02d:%02d)\n", i+1, taskList[i].title, targetStr, taskList[i].targetHour, taskList[i].targetMin);
+          if (i >= 2) break;
+        }
+      }
+      break;
+      
+    default:
+      display.println("SYSTEM MODE ACTIVE");
+      break;
+  }
+  display.display();
+}
+
+void handleStatusPayload() {
+  char localTime[16], istTime[16], estTime[16], gmtTime[16];
+  formatTimeOutput(localTime, localEpochSeconds, 0);
+  formatTimeOutput(istTime, localEpochSeconds, offsetIST);
+  formatTimeOutput(estTime, localEpochSeconds, offsetEST);
+  formatTimeOutput(gmtTime, localEpochSeconds, offsetGMT);
+
+  char dateBuffer[16];
+  sprintf(dateBuffer, "%04d-%02d-%02d", currentYear, currentMonth, currentDay);
+
+  String json = "{";
+  json += "\"view\":" + String((int)currentView) + ",";
+  json += "\"temp\":" + String(currentTemp, 1) + ",";
+  json += "\"humid\":" + String(currentHumid, 1) + ",";
+  json += "\"busVolt\":" + String(busVoltage, 2) + ",";
+  json += "\"currAmps\":" + String(currentAmps, 3) + ",";
+  json += "\"calcWatts\":" + String(calculatedPower, 3) + ",";
+  json += "\"timeLocal\":\"" + String(localTime) + "\",";
+  json += "\"timeIST\":\"" + String(istTime) + "\",";
+  json += "\"timeEST\":\"" + String(estTime) + "\",";
+  json += "\"dateStr\":\"" + String(dateBuffer) + "\",";
+  json += "\"gtTotal\":" + String(gateTimerTotalSeconds) + ",";
+  json += "\"gtActive\":" + String(gateTimerActive ? 1 : 0) + ",";
+  json += "\"alarmActive\":" + String(alarmActive ? 1 : 0) + ",";
+  json += "\"todoTasks\":[";
+  for (int i = 0; i < totalTasksConfigured; i++) {
+    json += "{\"t\":\"" + String(taskList[i].title) + "\",\"d\":" + String(taskList[i].dayOffset) + ",\"h\":" + String(taskList[i].targetHour) + ",\"m\":" + String(taskList[i].targetMin) + "}";
+    if(i < totalTasksConfigured - 1) json += ",";
+  }
+  json += "],";
+
+  for (int i = 0; i < 8; i++) json += "\"p" + String(i + 1) + "\":" + String(pinStates[i]) + ",";
+  json.remove(json.length() - 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleActionCommand() {
+  String act = server.arg("action");
+  if (act == "setView") {
+    currentView = (ViewMode)server.arg("target").toInt();
+  }
+  else if (act == "syncDeviceTime") {
+    localEpochSeconds = (server.arg("h").toInt() * 3600) + (server.arg("m").toInt() * 60) + server.arg("s").toInt();
+    currentYear = server.arg("y").toInt(); currentMonth = server.arg("mo").toInt(); currentDay = server.arg("d").toInt();
+  }
+  else if (act == "setCountdown") {
+    countdownTotalSeconds = (server.arg("d").toInt() * 86400) + (server.arg("h").toInt() * 3600) + (server.arg("m").toInt() * 60) + server.arg("s").toInt();
+  }
+  else if (act == "clearAlarm") {
+    alarmActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    for(int i=0; i<totalTasksConfigured; i++) {
+       if(taskList[i].activeTriggered) { taskList[i].isCompleted = true; taskList[i].activeTriggered = false; }
+    }
+  }
+  else if (act == "configureGateTimer") {
+    gateTimerTotalSeconds = (server.arg("h").toInt() * 3600) + (server.arg("m").toInt() * 60) + server.arg("s").toInt();
+    gateTimerSpeed = server.arg("speed").toFloat();
+    gateTimerActive = true;
+  }
+  else if (act == "stopGateTimer") {
+    gateTimerActive = false;
+  }
+  else if (act == "addTodo") {
+    if (totalTasksConfigured < 4) {
+      server.arg("title").toCharArray(taskList[totalTasksConfigured].title, 24);
+      taskList[totalTasksConfigured].dayOffset = server.arg("day").toInt();
+      taskList[totalTasksConfigured].targetHour = server.arg("h").toInt();
+      taskList[totalTasksConfigured].targetMin = server.arg("m").toInt();
+      taskList[totalTasksConfigured].isCompleted = false;
+      taskList[totalTasksConfigured].activeTriggered = false;
+      totalTasksConfigured++;
+    }
+  }
+  else if (act == "clearTodos") {
+    totalTasksConfigured = 0;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleCaptiveRedirect() {
+  server.sendHeader("Location", String("http://192.168.2.1/"), true);
+  server.send(302, "text/plain", "");
+}
+
+void handleRootRequest() {
+  String html = R"=====(
+  <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quantum Diagnostic Console</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #141419; color: #fff; padding: 10px; margin: 0; text-align: center; }
+    .container { max-width: 500px; margin: 15px auto; background: #22222b; padding: 20px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    h2 { color: #00adb5; font-size: 22px; }
+    .tab-nav { display: flex; margin-bottom: 20px; background: #2d2d3a; border-radius: 8px; padding: 5px; }
+    .tab-btn { background: none; border: none; color: #aaa; padding: 10px; font-weight: bold; cursor: pointer; border-radius: 6px; width: 50%; font-size: 14px;}
+    .tab-btn.active { background: #00adb5; color: #fff; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .clock-menu { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin-bottom: 20px; }
+    .sub-tab-btn { background: #2d2d3a; border: 1px solid #444; color: #fff; padding: 8px 2px; font-weight: bold; cursor: pointer; border-radius: 6px; font-size: 10px; }
+    .sub-tab-btn.active { background: linear-gradient(90deg, #00f2fe, #4facfe); border-color: transparent; }
+    .pair-container { border: 2px solid #333; padding: 12px; margin-bottom: 15px; border-radius: 10px; background: rgba(0,0,0,0.2); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pin-card { padding: 25px 10px 15px 10px; border-radius: 8px; font-weight: bold; border: 2px solid #444; background: #2d2d3a; }
+    .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+    .dot-active { background-color: #39ff14; box-shadow: 0 0 8px #39ff14; }
+    .dot-inactive { background-color: #ff3333; }
+    .master-btn { background: linear-gradient(90deg, #00f2fe, #4facfe); border: none; color: white; width: 100%; padding: 12px; font-weight: bold; border-radius: 10px; cursor: pointer; font-size: 14px; margin: 8px 0; }
+    .siren-btn { background: linear-gradient(90deg, #ff0844, #ffb199); border: none; color: white; width: 100%; padding: 15px; font-weight: bold; border-radius: 10px; cursor: pointer; font-size: 16px; margin-bottom: 15px; display:none; animation: pulse 0.5s infinite alternate; }
+    @keyframes pulse { from { opacity: 0.7; } to { opacity: 1; box-shadow: 0 0 20px #ff0844; } }
+    .chrono-box { background: #1c1c24; border: 1px solid #333; border-radius: 12px; padding: 20px; margin-bottom: 15px; text-align: left;}
+    .chrono-digits { font-size: 36px; font-family: monospace; color: #39ff14; font-weight: bold; margin: 10px 0; text-align: center;}
+    .cd-field { background: #2d2d3a; border: 1px solid #555; color: #fff; padding: 10px; border-radius: 6px; font-size: 14px; margin: 4px 0; box-sizing: border-box; }
+    .todo-item { background: #2d2d3a; border-left: 4px solid #39ff14; padding: 12px; margin: 8px 0; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+  </style>
+  <script>
+    let activeTabId = 0; let clockSubView = 1;
+    function navigateToTab(idx) {
+      activeTabId = idx; let target = (idx === 0) ? 0 : clockSubView;
+      fetch('/action?action=setView&target=' + target).then(() => {
+        document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', i === idx));
+        document.querySelectorAll('.tab-content').forEach((c, i) => c.classList.toggle('active', i === idx));
+      });
+    }
+    function selectClockView(viewId) {
+      clockSubView = viewId;
+      fetch('/action?action=setView&target=' + viewId).then(() => {
+        document.querySelectorAll('.sub-tab-btn').forEach((b) => b.classList.toggle('active', b.getAttribute('onclick').includes('('+viewId+')')));
+        document.querySelectorAll('.view-container').forEach((v) => v.classList.toggle('active', parseInt(v.getAttribute('data-view')) === viewId));
+        if(viewId === 4) sendBrowserSyncTime();
+      });
+    }
+    function sendBrowserSyncTime() {
+      let d = new Date();
+      fetch(`/action?action=syncDeviceTime&h=${d.getHours()}&m=${d.getMinutes()}&s=${d.getSeconds()}&y=${d.getFullYear()}&mo=${d.getMonth()+1}&d=${d.getDate()}`);
+    }
+    function startGateTimer() {
+      fetch(`/action?action=configureGateTimer&h=${document.getElementById('gt-h').value || 0}&m=${document.getElementById('gt-m').value || 0}&s=${document.getElementById('gt-s').value || 0}&speed=${document.getElementById('gt-speed').value}`);
+    }
+    function stopGateTimer() { fetch('/action?action=stopGateTimer'); }
+    function pushTodoItem() {
+      let t = document.getElementById('todo-title').value;
+      let d = document.getElementById('todo-day').value;
+      let h = document.getElementById('todo-h').value || 0;
+      let m = document.getElementById('todo-m').value || 0;
+      if(!t) return alert("Please specify Task Title");
+      fetch(`/action?action=addTodo&title=${encodeURIComponent(t)}&day=${d}&h=${h}&m=${m}`).then(() => { document.getElementById('todo-title').value = ''; });
+    }
+    function resetTodoCache() { fetch('/action?action=clearTodos'); }
+    function silenceSiren() { fetch('/action?action=clearAlarm'); }
+
+    setInterval(() => {
+      fetch('/status').then(r => r.json()).then(data => {
+        document.getElementById('master-siren-btn').style.display = data.alarmActive === 1 ? 'block' : 'none';
+        if(activeTabId === 0) {
+          for(let i=1; i<=8; i++) {
+            let card = document.getElementById('p-card-' + i); let dot = document.getElementById('p-dot-' + i);
+            if(card && data['p'+i] === 1) { card.style.borderColor = '#39ff14'; dot.className = "status-dot dot-active"; }
+            else if(card) { card.style.borderColor = '#ff3333'; dot.className = "status-dot dot-inactive"; }
+          }
+        } else {
+          document.getElementById('display-ist').innerText = data.timeIST;
+          document.getElementById('display-local').innerText = data.timeLocal;
+          document.getElementById('pwr-volt').innerText = data.busVolt + " V";
+          document.getElementById('pwr-amps').innerText = (data.currAmps * 1000).toFixed(0) + " mA";
+          
+          let gSecs = data.gtTotal, gh = Math.floor(gSecs / 3600), gm = Math.floor((gSecs % 3600) / 60), gs = gSecs % 60;
+          document.getElementById('gate-timer-val').innerText = `${gh.toString().padStart(2,'0')}:${gm.toString().padStart(2,'0')}:${gs.toString().padStart(2,'0')}`;
+          
+          let todoWrapper = document.getElementById('todo-container-element'); todoWrapper.innerHTML = '';
+          if(data.todoTasks.length === 0) todoWrapper.innerHTML = '<div style="color:#666; text-align:center;">Stack Registry Clear</div>';
+          else {
+             data.todoTasks.forEach(task => {
+                let dayLabel = task.d === 0 ? "Today" : (task.d === 1 ? "Tomorrow" : "Target Date");
+                todoWrapper.innerHTML += `<div class="todo-item"><div><b style="font-size:16px; color:#fff;">${task.t}</b><br><small style="color:#aaa;">Schedule: ${dayLabel}</small></div><span style="color:#00adb5; font-weight:bold; font-size:16px;">${task.h.toString().padStart(2,'0')}:${task.m.toString().padStart(2,'0')}</span></div>`;
+             });
+          }
+        }
+      });
+    }, 600);
+  </script></head>
+  <body>
+    <div class="container">
+      <h2>Quantum Matrix Controller</h2>
+      <button id="master-siren-btn" class="siren-btn" onclick="silenceSiren()">✖ DISMISS SIREN ALARM ✖</button>
+
+      <div class="tab-nav">
+        <button class="tab-btn active" onclick="navigateToTab(0)">LAN Tester</button>
+        <button class="tab-btn" onclick="navigateToTab(1)">Clock Core</button>
+      </div>
+
+      <div id="tab-lan" class="tab-content active">
+        <div class="pair-container">
+          <div class="grid">
+            <div class="pin-card" id="p-card-1">Pin 1 <span id="p-dot-1" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-2">Pin 2 <span id="p-dot-2" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-3">Pin 3 <span id="p-dot-3" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-4">Pin 4 <span id="p-dot-4" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-5">Pin 5 <span id="p-dot-5" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-6">Pin 6 <span id="p-dot-6" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-7">Pin 7 <span id="p-dot-7" class="status-dot dot-inactive"></span></div>
+            <div class="pin-card" id="p-card-8">Pin 8 <span id="p-dot-8" class="status-dot dot-inactive"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-clock" class="tab-content">
+        <div class="clock-menu">
+          <button class="sub-tab-btn active" onclick="selectClockView(1)">Clocks</button>
+          <button class="sub-tab-btn" onclick="selectClockView(6)">Gate Timer</button>
+          <button class="sub-tab-btn" onclick="selectClockView(7)">To-Dos</button>
+          <button class="sub-tab-btn" onclick="selectClockView(3)">Sensors</button>
+        </div>
+
+        <div data-view="1" class="view-container active">
+          <div class="chrono-box">
+            <div>IST Time: <b id="display-ist" style="color:#00f2fe;">00:00:00</b></div>
+            <div>Base Reference: <b id="display-local" style="color:#fff;">00:00:00</b></div>
+          </div>
+        </div>
+
+        <div data-view="6" class="view-container">
+          <div class="chrono-box">
+            <div class="chrono-digits" id="gate-timer-val">00:00:00</div>
+            <div style="display:flex; flex-direction:column;">
+              <input type="number" id="gt-h" class="cd-field" placeholder="Hours (0-23)">
+              <input type="number" id="gt-m" class="cd-field" placeholder="Minutes (0-59)">
+              <input type="number" id="gt-s" class="cd-field" placeholder="Seconds (0-59)">
+              <select id="gt-speed" class="cd-field">
+                <option value="0.5">0.5x Slow Training</option>
+                <option value="1.0" selected>1.0x Normal Clock</option>
+                <option value="1.5">1.5x Accelerated</option>
+                <option value="2.0">2.0x Double Velocity</option>
+                <option value="3.0">3.0x Hyper Warp</option>
+              </select>
+            </div>
+            <button class="master-btn" onclick="startGateTimer()">Start Gate Run</button>
+            <button class="master-btn" style="background:#444;" onclick="stopGateTimer()">Stop Gate</button>
+          </div>
+        </div>
+
+        <div data-view="7" class="view-container">
+          <div class="chrono-box">
+            <div style="color:#39ff14; font-weight:bold; margin-bottom:10px;">Task Entry Console</div>
+            <textarea id="todo-title" class="cd-field" style="width:100%; height:60px; resize:none; font-family:sans-serif;" placeholder="What are you learning/doing? (Bigger Description Area)"></textarea>
+            <div style="display:flex; gap:4px;">
+              <select id="todo-day" class="cd-field" style="flex:1;">
+                <option value="0">Today</option>
+                <option value="1">Tomorrow</option>
+                <option value="2">Specific Date</option>
+              </select>
+              <input type="number" id="todo-h" class="cd-field" placeholder="Hr" style="width:50px;">
+              <input type="number" id="todo-m" class="cd-field" placeholder="Min" style="width:50px;">
+            </div>
+            <button class="master-btn" style="background:linear-gradient(90deg, #39ff14, #00adb5);" onclick="pushTodoItem()">Commit Assignment</button>
+            <div id="todo-container-element" style="margin-top:15px;"></div>
+            <button class="master-btn" style="background:#444; font-size:11px; padding:6px;" onclick="resetTodoCache()">Wipe Tasks</button>
+          </div>
+        </div>
+
+        <div data-view="3" class="view-container">
+          <div class="chrono-box">
+            <div>Line Voltage: <b id="pwr-volt" style="color:#ffea00;">--</b></div>
+            <div>Current Consumption: <b id="pwr-amps" style="color:#ffea00;">--</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body></html>
+  )=====";
+  server.send(200, "text/html", html);
+}

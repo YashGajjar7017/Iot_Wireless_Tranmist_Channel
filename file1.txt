@@ -1,0 +1,315 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+
+const char* ssid = "FREE-LAN-Tester";
+
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+const int lanPins[8] = {16, -1, 5, 4, 0, 2, 14, 12};
+int pinStates[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+void readPins() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] == -1) {
+      pinStates[i] = 0; 
+    } else {
+      pinStates[i] = digitalRead(lanPins[i]); 
+    }
+  }
+}
+
+void handleStatus() {
+  readPins();
+  String json = "{";
+  for(int i = 0; i < 8; i++) {
+    json += "\"p" + String(i+1) + "\":" + String(pinStates[i]);
+    if(i < 7) json += ",";
+  }
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleRoot() {
+  String html = R"=====(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ethernet T568B Utility Hub</title>
+    <style>
+      body { font-family: 'Segoe UI', Arial, sans-serif; text-align: center; background: #141419; color: #fff; padding: 10px; margin: 0; }
+      .container { max-width: 500px; margin: 15px auto; background: #22222b; padding: 20px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+      h2 { margin-bottom: 5px; color: #00adb5; font-size: 22px; }
+      
+      /* Tab System Navigation */
+      .tab-nav { display: flex; justify-content: space-around; margin-bottom: 20px; background: #2d2d3a; border-radius: 8px; padding: 5px; }
+      .tab-btn { background: none; border: none; color: #aaa; padding: 10px 20px; font-weight: bold; cursor: pointer; border-radius: 6px; width: 50%; transition: 0.2s; font-size: 14px;}
+      .tab-btn.active { background: #00adb5; color: #fff; }
+      .tab-content { display: none; }
+      .tab-content.active { display: block; }
+
+      .instructions { color: #888; font-size: 13px; margin-bottom: 20px; }
+      .pair-container { border: 2px solid #333; padding: 12px; margin-bottom: 15px; border-radius: 10px; background: rgba(0,0,0,0.2); transition: border-color 0.2s; }
+      .pair-title { font-size: 12px; text-transform: uppercase; color: #00adb5; text-align: left; margin-bottom: 8px; font-weight: bold; letter-spacing: 1px; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      
+      .pin-card { position: relative; padding: 15px 10px; border-radius: 8px; font-weight: bold; color: white; cursor: pointer; border: 2px solid #444; background: #2d2d3a; transition: transform 0.15s, border-color 0.15s; text-align: center; }
+      .pin-card:hover { transform: scale(1.02); }
+      
+      /* Color Strip Badges */
+      .wire-stripe { position: absolute; top: 0; left: 0; right: 0; height: 6px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+      .w-orange { background: linear-gradient(90deg, #fff 50%, #ff6b35 50%); background-size: 15px 10px; }
+      .orange { background: #ff6b35; }
+      .w-green { background: linear-gradient(90deg, #fff 50%, #4ecdc4 50%); background-size: 15px 10px; }
+      .green { background: #4ecdc4; }
+      .blue { background: #1a8fe3; }
+      .w-blue { background: linear-gradient(90deg, #fff 50%, #1a8fe3 50%); background-size: 15px 10px; }
+      .w-brown { background: linear-gradient(90deg, #fff 50%, #8b5a2b 50%); background-size: 15px 10px; }
+      .brown { background: #8b5a2b; }
+
+      .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+      .dot-active { background-color: #39ff14; box-shadow: 0 0 8px #39ff14; }
+      .dot-inactive { background-color: #ff3333; }
+      .focused-pair-block { border-color: #00adb5 !important; background: rgba(0, 173, 181, 0.05); }
+
+      /* Visual Guide Table Styles */
+      .guide-table { width: 100%; border-collapse: collapse; margin-top: 15px; text-align: left; font-size: 14px;}
+      .guide-table th, .guide-table td { padding: 12px 10px; border-bottom: 1px solid #333; }
+      .guide-table th { background: #2d2d3a; color: #00adb5; font-weight: bold; }
+      .color-cell { display: flex; align-items: center; gap: 8px; }
+      .color-dot { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #555;}
+    </style>
+    <script>
+      let activeFocusGroup = null;
+
+      setInterval(() => {
+        // Only run live fetch if the tester tab is currently visible
+        if(document.getElementById('tester-tab').classList.contains('active')) {
+          fetch('/status').then(r => r.json()).then(data => {
+            updateCard('p1', data.p1, 'Pin 1: TX+', 'Pair 2 (TX)');
+            updateCard('p2', data.p2, 'Pin 2: TX- [GND]', 'Pair 2 (TX)');
+            updateCard('p3', data.p3, 'Pin 3: RX+', 'Pair 3 (RX)');
+            updateCard('p6', data.p6, 'Pin 6: RX-', 'Pair 3 (RX)');
+            updateCard('p4', data.p4, 'Pin 4: Unused', 'Pair 1 (Unused)');
+            updateCard('p5', data.p5, 'Pin 5: Unused', 'Pair 1 (Unused)');
+            updateCard('p7', data.p7, 'Pin 7: Unused', 'Pair 4 (Unused)');
+            updateCard('p8', data.p8, 'Pin 8: Unused', 'Pair 4 (Unused)');
+          });
+        }
+      }, 400);
+
+      function updateCard(id, state, label, groupName) {
+        const card = document.getElementById(id);
+        if(!card) return;
+        
+        card.dataset.group = groupName;
+        const textSpan = card.querySelector('.card-text');
+        const dot = card.querySelector('.status-dot');
+        
+        const parentBlock = card.closest('.pair-container');
+        if (activeFocusGroup === groupName) {
+          parentBlock.classList.add('focused-pair-block');
+        } else {
+          parentBlock.classList.remove('focused-pair-block');
+        }
+
+        if(id === 'p2') {
+          dot.className = "status-dot dot-active";
+          textSpan.innerText = label + " (REF)";
+          return;
+        }
+
+        if(state === 1) {
+          dot.className = "status-dot dot-active";
+          card.style.borderColor = "#39ff14";
+          textSpan.innerText = label + " [LIVE]";
+        } else {
+          dot.className = "status-dot dot-inactive";
+          card.style.borderColor = "#444";
+          textSpan.innerText = label + " [OPEN]";
+        }
+      }
+
+      function handlePinClick(el) {
+        const targetGroup = el.dataset.group;
+        activeFocusGroup = (activeFocusGroup === targetGroup) ? null : targetGroup;
+      }
+
+      function switchTab(tabId, btn) {
+        document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(tabId).classList.add('active');
+        btn.classList.add('active');
+      }
+    </script>
+  </head>
+  <body>
+    <div class="container">
+      <h2>LAN Toolkit Dashboard</h2>
+      
+      <div class="tab-nav">
+        <button class="tab-btn active" onclick="switchTab('tester-tab', this)">Live Tester</button>
+        <button class="tab-btn" onclick="switchTab('guide-tab', this)">Pin Connection Diagram</button>
+      </div>
+
+      <div id="tester-tab" class="tab-content active">
+        <p class="instructions">Click any wire card below to isolate and highlight its active twisted pair channel.</p>
+        
+        <div class="pair-container">
+          <div class="pair-title">Pair 2: Transmit Loop (10/100 Mbps)</div>
+          <div class="grid">
+            <div id="p1" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe w-orange"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 1: Loading...</span>
+            </div>
+            <div id="p2" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe orange"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 2: Loading...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pair-container">
+          <div class="pair-title">Pair 3: Receive Loop (10/100 Mbps)</div>
+          <div class="grid">
+            <div id="p3" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe w-green"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 3: Loading...</span>
+            </div>
+            <div id="p6" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe green"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 6: Loading...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pair-container">
+          <div class="pair-title">Pair 1: Unused Data Lines</div>
+          <div class="grid">
+            <div id="p4" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe blue"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 4: Loading...</span>
+            </div>
+            <div id="p5" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe w-blue"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 5: Loading...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pair-container">
+          <div class="pair-title">Pair 4: Unused Data Lines</div>
+          <div class="grid">
+            <div id="p7" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe w-brown"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 7: Loading...</span>
+            </div>
+            <div id="p8" class="pin-card" onclick="handlePinClick(this)">
+              <div class="wire-stripe brown"></div>
+              <span class="status-dot dot-inactive"></span><span class="card-text">Pin 8: Loading...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="guide-tab" class="tab-content">
+        <p class="instructions">Align your RJ45 clip facing down, and arrange cables left-to-right (1 to 8):</p>
+        <table class="guide-table">
+          <thead>
+            <tr>
+              <th>Pin</th>
+              <th>Wire Color Pattern</th>
+              <th>Pair</th>
+              <th>Signal Assignment</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>1</b></td>
+              <td><div class="color-cell"><div class="color-dot w-orange"></div>White/Orange</div></td>
+              <td>Pair 2</td>
+              <td>TX+ (Transmit +)</td>
+            </tr>
+            <tr>
+              <td><b>2</b></td>
+              <td><div class="color-cell"><div class="color-dot orange"></div>Orange</div></td>
+              <td>Pair 2</td>
+              <td>TX− (Transmit −)</td>
+            </tr>
+            <tr>
+              <td><b>3</b></td>
+              <td><div class="color-cell"><div class="color-dot w-green"></div>White/Green</div></td>
+              <td>Pair 3</td>
+              <td>RX+ (Receive +)</td>
+            </tr>
+            <tr>
+              <td><b>4</b></td>
+              <td><div class="color-cell"><div class="color-dot blue"></div>Blue</div></td>
+              <td>Pair 1</td>
+              <td>Unused (10/100)</td>
+            </tr>
+            <tr>
+              <td><b>5</b></td>
+              <td><div class="color-cell"><div class="color-dot w-blue"></div>White/Blue</div></td>
+              <td>Pair 1</td>
+              <td>Unused (10/100)</td>
+            </tr>
+            <tr>
+              <td><b>6</b></td>
+              <td><div class="color-cell"><div class="color-dot green"></div>Green</div></td>
+              <td>Pair 3</td>
+              <td>RX− (Receive −)</td>
+            </tr>
+            <tr>
+              <td><b>7</b></td>
+              <td><div class="color-cell"><div class="color-dot w-brown"></div>White/Brown</div></td>
+              <td>Pair 4</td>
+              <td>Unused (10/100)</td>
+            </tr>
+            <tr>
+              <td><b>8</b></td>
+              <td><div class="color-cell"><div class="color-dot brown"></div>Brown</div></td>
+              <td>Pair 4</td>
+              <td>Unused (10/100)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+    </div>
+  </body>
+  </html>
+  )=====";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  for (int i = 0; i < 8; i++) {
+    if (lanPins[i] != -1) {
+      pinMode(lanPins[i], INPUT); 
+    }
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(ssid);
+
+  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  
+  server.onNotFound([]() {
+    server.sendHeader("Location", String("http://192.168.4.1/"), true);
+    server.send(302, "text/plain", "");
+  });
+  
+  server.begin();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+}
